@@ -1043,10 +1043,6 @@ int Control::_get_anchors_layout_preset() const {
 	float top = get_anchor(SIDE_TOP);
 	float bottom = get_anchor(SIDE_BOTTOM);
 
-	if (get_offset(SIDE_LEFT) != 0.0 || get_offset(SIDE_RIGHT) != 0.0 || get_offset(SIDE_TOP) != 0.0 || get_offset(SIDE_BOTTOM) != 0.0) {
-		return -1;
-	}
-
 	if (left == (float)ANCHOR_BEGIN && right == (float)ANCHOR_BEGIN && top == (float)ANCHOR_BEGIN && bottom == (float)ANCHOR_BEGIN) {
 		return (int)LayoutPreset::PRESET_TOP_LEFT;
 	}
@@ -3905,14 +3901,6 @@ void Control::_notification(int p_notification) {
 			RenderingServer::get_singleton()->canvas_item_set_clip(get_canvas_item(), data.clip_contents);
 		} break;
 
-		case NOTIFICATION_MOUSE_ENTER: {
-			emit_signal(SceneStringName(mouse_entered));
-		} break;
-
-		case NOTIFICATION_MOUSE_EXIT: {
-			emit_signal(SceneStringName(mouse_exited));
-		} break;
-
 		case NOTIFICATION_FOCUS_ENTER: {
 			emit_signal(SceneStringName(focus_entered));
 			queue_redraw();
@@ -4404,6 +4392,8 @@ void Control::_bind_methods() {
 }
 
 Control::Control() {
+	_define_ancestry(AncestralClass::CONTROL);
+
 	data.theme_owner = memnew(ThemeOwner(this));
 
 	set_physics_interpolation_mode(Node::PHYSICS_INTERPOLATION_MODE_OFF);

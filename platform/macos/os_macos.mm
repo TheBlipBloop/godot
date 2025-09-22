@@ -315,7 +315,9 @@ String OS_MacOS::get_version() const {
 String OS_MacOS::get_version_alias() const {
 	NSOperatingSystemVersion ver = [NSProcessInfo processInfo].operatingSystemVersion;
 	String macos_string;
-	if (ver.majorVersion == 15) {
+	if (ver.majorVersion == 26) {
+		macos_string += "Tahoe";
+	} else if (ver.majorVersion == 15) {
 		macos_string += "Sequoia";
 	} else if (ver.majorVersion == 14) {
 		macos_string += "Sonoma";
@@ -462,6 +464,19 @@ String OS_MacOS::get_bundle_icon_path() const {
 		NSString *icon_path = [[main infoDictionary] objectForKey:@"CFBundleIconFile"];
 		if (icon_path) {
 			ret.append_utf8([icon_path UTF8String]);
+		}
+	}
+	return ret;
+}
+
+String OS_MacOS::get_bundle_icon_name() const {
+	String ret;
+
+	NSBundle *main = [NSBundle mainBundle];
+	if (main) {
+		NSString *icon_name = [[main infoDictionary] objectForKey:@"CFBundleIconName"];
+		if (icon_name) {
+			ret.append_utf8([icon_name UTF8String]);
 		}
 	}
 	return ret;
@@ -1261,6 +1276,11 @@ void OS_MacOS_Embedded::run() {
 				@try {
 					ds->process_events();
 
+#ifdef SDL_ENABLED
+					if (joypad_sdl) {
+						joypad_sdl->process_events();
+					}
+#endif
 					if (Main::iteration()) {
 						break;
 					}

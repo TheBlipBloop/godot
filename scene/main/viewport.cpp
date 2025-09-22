@@ -43,8 +43,8 @@
 #include "scene/gui/subviewport_container.h"
 #include "scene/main/canvas_layer.h"
 #include "scene/main/window.h"
+#include "scene/resources/dpi_texture.h"
 #include "scene/resources/mesh.h"
-#include "scene/resources/svg_texture.h"
 #include "scene/resources/text_line.h"
 #include "scene/resources/world_2d.h"
 #include "servers/audio_server.h"
@@ -1090,8 +1090,8 @@ bool Viewport::_set_size(const Size2i &p_size, const Size2 &p_size_2d_override, 
 		TS->reference_oversampling_level(new_font_oversampling);
 		TS->unreference_oversampling_level(font_oversampling);
 
-		SVGTexture::reference_scaling_level(new_font_oversampling);
-		SVGTexture::unreference_scaling_level(font_oversampling);
+		DPITexture::reference_scaling_level(new_font_oversampling);
+		DPITexture::unreference_scaling_level(font_oversampling);
 	}
 
 	size = new_size;
@@ -1539,6 +1539,11 @@ String Viewport::_gui_get_tooltip(Control *p_control, const Vector2 &p_pos, Cont
 		// Temporary solution for PopupMenus.
 		PopupMenu *menu = Object::cast_to<PopupMenu>(this);
 		if (menu) {
+			Ref<StyleBox> sb = menu->get_theme_stylebox(SceneStringName(panel));
+			if (sb.is_valid()) {
+				pos.y += sb->get_margin(SIDE_TOP);
+			}
+
 			tooltip = menu->get_tooltip(pos);
 		}
 
@@ -2301,15 +2306,15 @@ void Viewport::_gui_input_event(Ref<InputEvent> p_event) {
 			if (joypadmotion_event.is_valid()) {
 				Input *input = Input::get_singleton();
 
-				if (p_event->is_action_pressed(SNAME("ui_focus_next")) && input->is_action_just_pressed(SNAME("ui_focus_next"))) {
+				if (p_event->is_action_pressed(SNAME("ui_focus_next")) && input->is_action_just_pressed_by_event(SNAME("ui_focus_next"), p_event)) {
 					next = from->find_next_valid_focus();
 				}
 
-				if (p_event->is_action_pressed(SNAME("ui_focus_prev")) && input->is_action_just_pressed(SNAME("ui_focus_prev"))) {
+				if (p_event->is_action_pressed(SNAME("ui_focus_prev")) && input->is_action_just_pressed_by_event(SNAME("ui_focus_prev"), p_event)) {
 					next = from->find_prev_valid_focus();
 				}
 
-				if (p_event->is_action_pressed(SNAME("ui_accessibility_drag_and_drop")) && input->is_action_just_pressed(SNAME("ui_accessibility_drag_and_drop"))) {
+				if (p_event->is_action_pressed(SNAME("ui_accessibility_drag_and_drop")) && input->is_action_just_pressed_by_event(SNAME("ui_accessibility_drag_and_drop"), p_event)) {
 					if (gui_is_dragging()) {
 						from->accessibility_drop();
 					} else {
@@ -2317,19 +2322,19 @@ void Viewport::_gui_input_event(Ref<InputEvent> p_event) {
 					}
 				}
 
-				if (p_event->is_action_pressed(SNAME("ui_up")) && input->is_action_just_pressed(SNAME("ui_up"))) {
+				if (p_event->is_action_pressed(SNAME("ui_up")) && input->is_action_just_pressed_by_event(SNAME("ui_up"), p_event)) {
 					next = from->_get_focus_neighbor(SIDE_TOP);
 				}
 
-				if (p_event->is_action_pressed(SNAME("ui_left")) && input->is_action_just_pressed(SNAME("ui_left"))) {
+				if (p_event->is_action_pressed(SNAME("ui_left")) && input->is_action_just_pressed_by_event(SNAME("ui_left"), p_event)) {
 					next = from->_get_focus_neighbor(SIDE_LEFT);
 				}
 
-				if (p_event->is_action_pressed(SNAME("ui_right")) && input->is_action_just_pressed(SNAME("ui_right"))) {
+				if (p_event->is_action_pressed(SNAME("ui_right")) && input->is_action_just_pressed_by_event(SNAME("ui_right"), p_event)) {
 					next = from->_get_focus_neighbor(SIDE_RIGHT);
 				}
 
-				if (p_event->is_action_pressed(SNAME("ui_down")) && input->is_action_just_pressed(SNAME("ui_down"))) {
+				if (p_event->is_action_pressed(SNAME("ui_down")) && input->is_action_just_pressed_by_event(SNAME("ui_down"), p_event)) {
 					next = from->_get_focus_neighbor(SIDE_BOTTOM);
 				}
 			} else {
@@ -2612,6 +2617,7 @@ void Viewport::_gui_update_mouse_over() {
 	// Send Mouse Exit notifications.
 	for (int exit_control_index : needs_exit) {
 		gui.mouse_over_hierarchy[exit_control_index]->notification(Control::NOTIFICATION_MOUSE_EXIT);
+		gui.mouse_over_hierarchy[exit_control_index]->emit_signal(SceneStringName(mouse_exited));
 	}
 
 	// Update the mouse over hierarchy.
@@ -2623,6 +2629,7 @@ void Viewport::_gui_update_mouse_over() {
 	// Send Mouse Enter notifications.
 	for (int i = needs_enter.size() - 1; i >= 0; i--) {
 		needs_enter[i]->notification(Control::NOTIFICATION_MOUSE_ENTER);
+		needs_enter[i]->emit_signal(SceneStringName(mouse_entered));
 	}
 
 	gui.sending_mouse_enter_exit_notifications = false;
@@ -3092,6 +3099,24 @@ bool Viewport::_sub_windows_forward_input(const Ref<InputEvent> &p_event) {
 	}
 
 	if (!gui.subwindow_focused) {
+		// No window focus, check for unfocusable windows under the cursor.
+		Ref<InputEventMouse> me = p_event;
+		if (me.is_valid()) {
+			for (int i = gui.sub_windows.size() - 1; i >= 0; i--) {
+				const SubWindow &sw = gui.sub_windows[i];
+				if (!sw.window->get_flag(Window::FLAG_NO_FOCUS) || sw.window->get_flag(Window::FLAG_MOUSE_PASSTHROUGH)) {
+					continue;
+				}
+				Rect2i r = Rect2i(sw.window->get_position(), sw.window->get_size());
+				if (r.has_point(me->get_position())) {
+					Transform2D window_ofs;
+					window_ofs.set_origin(-sw.window->get_position());
+					Ref<InputEvent> ev = p_event->xformed_by(window_ofs);
+					sw.window->_window_input(ev);
+					return true;
+				}
+			}
+		}
 		return false;
 	}
 
@@ -3276,6 +3301,7 @@ void Viewport::_update_mouse_over(Vector2 p_pos) {
 			for (int i = over_ancestors.size() - 1; i >= 0; i--) {
 				gui.mouse_over_hierarchy.push_back(over_ancestors[i]);
 				over_ancestors[i]->notification(Control::NOTIFICATION_MOUSE_ENTER);
+				over_ancestors[i]->emit_signal(SceneStringName(mouse_entered));
 			}
 
 			// Send Mouse Enter Self notification.
@@ -3367,6 +3393,7 @@ void Viewport::_drop_mouse_over(Control *p_until_control) {
 	for (int i = gui.mouse_over_hierarchy.size() - 1; i >= notification_until; i--) {
 		if (gui.mouse_over_hierarchy[i]->is_inside_tree()) {
 			gui.mouse_over_hierarchy[i]->notification(Control::NOTIFICATION_MOUSE_EXIT);
+			gui.mouse_over_hierarchy[i]->emit_signal(SceneStringName(mouse_exited));
 		}
 	}
 	gui.mouse_over_hierarchy.resize(notification_until);
@@ -5185,7 +5212,7 @@ void Viewport::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "canvas_cull_mask", PROPERTY_HINT_LAYERS_2D_RENDER), "set_canvas_cull_mask", "get_canvas_cull_mask");
 
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "oversampling"), "set_use_oversampling", "is_using_oversampling");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "oversampling_override"), "set_oversampling_override", "get_oversampling_override");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "oversampling_override", PROPERTY_HINT_RANGE, "0,16,0.0001,or_greater"), "set_oversampling_override", "get_oversampling_override");
 
 	ADD_SIGNAL(MethodInfo("size_changed"));
 	ADD_SIGNAL(MethodInfo("gui_focus_changed", PropertyInfo(Variant::OBJECT, "node", PROPERTY_HINT_RESOURCE_TYPE, "Control")));

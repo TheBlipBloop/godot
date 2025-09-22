@@ -510,6 +510,11 @@ void EditorNode::_update_from_settings() {
 	Viewport::MSAA msaa = Viewport::MSAA(int(GLOBAL_GET("rendering/anti_aliasing/quality/msaa_2d")));
 	scene_root->set_msaa_2d(msaa);
 
+	// 2D doesn't use a dedicated SubViewport like 3D does, so we apply it on the root viewport instead.
+	bool use_debanding = GLOBAL_GET("rendering/anti_aliasing/quality/use_debanding");
+	scene_root->set_use_debanding(use_debanding);
+	get_viewport()->set_use_debanding(use_debanding);
+
 	bool use_hdr_2d = GLOBAL_GET("rendering/viewport/hdr_2d");
 	scene_root->set_use_hdr_2d(use_hdr_2d);
 	get_viewport()->set_use_hdr_2d(use_hdr_2d);
@@ -851,7 +856,7 @@ void EditorNode::_notification(int p_what) {
 
 			command_palette->register_shortcuts_as_command();
 
-			callable_mp(this, &EditorNode::_begin_first_scan).call_deferred();
+			_begin_first_scan();
 
 			last_dark_mode_state = DisplayServer::get_singleton()->is_dark_mode();
 			last_system_accent_color = DisplayServer::get_singleton()->get_accent_color();
@@ -2764,7 +2769,6 @@ void EditorNode::_edit_current(bool p_skip_foreign, bool p_skip_inspector_update
 	}
 
 	bool inspector_only = editor_history.is_current_inspector_only();
-	current = current_obj;
 
 	if (!current_obj) {
 		SceneTreeDock::get_singleton()->set_selected(nullptr);
@@ -2921,6 +2925,9 @@ void EditorNode::_edit_current(bool p_skip_foreign, bool p_skip_inspector_update
 				if (!changing_scene) {
 					main_plugin->edit(current_obj);
 				}
+			} else if (Object::cast_to<Script>(current_obj)) {
+				editor_main_screen->select(plugin_index);
+				main_plugin->edit(current_obj);
 			} else if (main_plugin != editor_plugin_screen) {
 				// Unedit previous plugin.
 				editor_plugin_screen->edit(nullptr);
@@ -3044,7 +3051,7 @@ void EditorNode::_menu_option_confirm(int p_option, bool p_confirmed) {
 			}
 			_proceed_closing_scene_tabs();
 		} break;
-		case EditorSceneTabs::SCENE_CLOSE_ALL: {
+		case SCENE_CLOSE_ALL: {
 			tab_closing_menu_option = -1;
 			for (int i = 0; i < editor_data.get_edited_scene_count(); i++) {
 				tabs_to_close.push_back(editor_data.get_scene_path(i));
@@ -3312,8 +3319,14 @@ void EditorNode::_menu_option_confirm(int p_option, bool p_confirmed) {
 				p_confirmed = false;
 			}
 
+			if (p_confirmed && stop_project_confirmation && project_run_bar->is_playing()) {
+				project_run_bar->stop_playing();
+				stop_project_confirmation = false;
+				p_confirmed = false;
+			}
+
 			if (!p_confirmed) {
-				if (project_run_bar->is_playing()) {
+				if (!stop_project_confirmation && project_run_bar->is_playing()) {
 					if (p_option == PROJECT_RELOAD_CURRENT_PROJECT) {
 						confirmation->set_text(TTR("Stop running project before reloading the current project?"));
 						confirmation->set_ok_button_text(TTR("Stop & Reload"));
@@ -3324,6 +3337,7 @@ void EditorNode::_menu_option_confirm(int p_option, bool p_confirmed) {
 					confirmation->reset_size();
 					confirmation->popup_centered();
 					confirmation_button->hide();
+					stop_project_confirmation = true;
 					break;
 				}
 
@@ -4084,6 +4098,7 @@ bool EditorNode::is_addon_plugin_enabled(const String &p_addon) const {
 void EditorNode::_remove_edited_scene(bool p_change_tab) {
 	// When scene gets closed no node is edited anymore, so make sure the editors are notified before nodes are freed.
 	hide_unused_editors(SceneTreeDock::get_singleton());
+	SceneTreeDock::get_singleton()->clear_previous_node_selection();
 
 	int new_index = editor_data.get_edited_scene();
 	int old_index = new_index;
@@ -4241,6 +4256,7 @@ void EditorNode::_set_current_scene_nocheck(int p_idx) {
 	Node *old_scene = get_editor_data().get_edited_scene_root();
 
 	editor_selection->clear();
+	SceneTreeDock::get_singleton()->clear_previous_node_selection();
 	editor_data.set_edited_scene(p_idx);
 
 	Node *new_scene = editor_data.get_edited_scene_root();
@@ -4291,7 +4307,7 @@ void EditorNode::setup_color_picker(ColorPicker *p_picker) {
 	p_picker->set_editor_settings(EditorSettings::get_singleton());
 	int default_color_mode = EditorSettings::get_singleton()->get_project_metadata("color_picker", "color_mode", EDITOR_GET("interface/inspector/default_color_picker_mode"));
 	int picker_shape = EditorSettings::get_singleton()->get_project_metadata("color_picker", "picker_shape", EDITOR_GET("interface/inspector/default_color_picker_shape"));
-	bool show_intensity = EditorSettings::get_singleton()->get_project_metadata("color_picker", "show_intensity", EDITOR_GET("interface/inspector/color_picker_show_intensity"));
+	bool show_intensity = EDITOR_GET("interface/inspector/color_picker_show_intensity");
 
 	p_picker->set_color_mode((ColorPicker::ColorModeType)default_color_mode);
 	p_picker->set_picker_shape((ColorPicker::PickerShapeType)picker_shape);
@@ -4460,6 +4476,8 @@ Error EditorNode::load_scene(const String &p_scene, bool p_ignore_broken_deps, b
 	new_scene->set_scene_instance_state(Ref<SceneState>());
 
 	set_edited_scene(new_scene);
+	// When editor plugins load in, they might use node transforms during their own setup, so make sure they're up to date.
+	get_tree()->flush_transform_notifications();
 
 	String config_file_path = EditorPaths::get_singleton()->get_project_settings_dir().path_join(lpath.get_file() + "-editstate-" + lpath.md5_text() + ".cfg");
 	Ref<ConfigFile> editor_state_cf;
@@ -5340,15 +5358,19 @@ bool EditorNode::is_object_of_custom_type(const Object *p_object, const StringNa
 }
 
 // Used to track the progress of tasks in the CLI output (since we don't have any other frame of reference).
-// All tasks run sequentially, so we can just keep a single counter.
-static int progress_total_steps = 0;
+static HashMap<String, int> progress_total_steps;
+
+static String last_progress_task;
+static String last_progress_state;
+static int last_progress_step = 0;
+static double last_progress_time = 0;
 
 void EditorNode::progress_add_task(const String &p_task, const String &p_label, int p_steps, bool p_can_cancel) {
 	if (!singleton) {
 		return;
 	} else if (singleton->cmdline_mode) {
 		print_line_rich(vformat("[   0%% ] [color=gray][b]%s[/b] | Started %s (%d steps)[/color]", p_task, p_label, p_steps));
-		progress_total_steps = p_steps;
+		progress_total_steps[p_task] = p_steps;
 	} else if (singleton->progress_dialog) {
 		singleton->progress_dialog->add_task(p_task, p_label, p_steps, p_can_cancel);
 	}
@@ -5358,8 +5380,18 @@ bool EditorNode::progress_task_step(const String &p_task, const String &p_state,
 	if (!singleton) {
 		return false;
 	} else if (singleton->cmdline_mode) {
-		const int percent = (p_step / float(progress_total_steps + 1)) * 100;
-		print_line_rich(vformat("[%4d%% ] [color=gray][b]%s[/b] | %s[/color]", percent, p_task, p_state));
+		double current_time = USEC_TO_SEC(OS::get_singleton()->get_ticks_usec());
+		double elapsed_time = current_time - last_progress_time;
+		if (p_task != last_progress_task || p_state != last_progress_state || p_step != last_progress_step || elapsed_time >= 1.0) {
+			// Only print the progress if it's changed since the last print, or if one second has passed.
+			// This prevents multithreaded import from printing the same progress too often, which would bloat the log file.
+			const int percent = (p_step / float(progress_total_steps[p_task] + 1)) * 100;
+			print_line_rich(vformat("[%4d%% ] [color=gray][b]%s[/b] | %s[/color]", percent, p_task, p_state));
+			last_progress_task = p_task;
+			last_progress_state = p_state;
+			last_progress_step = p_step;
+			last_progress_time = current_time;
+		}
 		return false;
 	} else if (singleton->progress_dialog) {
 		return singleton->progress_dialog->task_step(p_task, p_state, p_step, p_force_refresh);
@@ -5372,6 +5404,7 @@ void EditorNode::progress_end_task(const String &p_task) {
 	if (!singleton) {
 		return;
 	} else if (singleton->cmdline_mode) {
+		progress_total_steps.erase(p_task);
 		print_line_rich(vformat("[color=green][ DONE ][/color] [b]%s[/b]\n", p_task));
 	} else if (singleton->progress_dialog) {
 		singleton->progress_dialog->end_task(p_task);
@@ -5608,14 +5641,6 @@ void EditorNode::_editor_file_dialog_unregister(EditorFileDialog *p_dialog) {
 Vector<EditorNodeInitCallback> EditorNode::_init_callbacks;
 
 void EditorNode::_begin_first_scan() {
-	// In headless mode, scan right away.
-	// This allows users to continue using `godot --headless --editor --quit` to prepare a project.
-	if (!DisplayServer::get_singleton()->window_can_draw()) {
-		OS::get_singleton()->benchmark_begin_measure("Editor", "First Scan");
-		EditorFileSystem::get_singleton()->scan();
-		return;
-	}
-
 	if (!waiting_for_first_scan) {
 		return;
 	}
@@ -6007,6 +6032,11 @@ bool EditorNode::immediate_confirmation_dialog(const String &p_text, const Strin
 	return singleton->immediate_dialog_confirmed;
 }
 
+bool EditorNode::is_cmdline_mode() {
+	ERR_FAIL_NULL_V(singleton, false);
+	return singleton->cmdline_mode;
+}
+
 void EditorNode::cleanup() {
 	_init_callbacks.clear();
 }
@@ -6209,6 +6239,10 @@ void EditorNode::_cancel_close_scene_tab() {
 	}
 	changing_scene = false;
 	tabs_to_close.clear();
+}
+
+void EditorNode::_cancel_confirmation() {
+	stop_project_confirmation = false;
 }
 
 void EditorNode::_prepare_save_confirmation_popup() {
@@ -7371,13 +7405,13 @@ void EditorNode::_update_main_menu_type() {
 		menu_btn_spacer = memnew(Control);
 		menu_btn_spacer->set_custom_minimum_size(Vector2(8, 0) * EDSCALE);
 		title_bar->add_child(menu_btn_spacer);
-		title_bar->move_child(menu_btn_spacer, 0);
+		title_bar->move_child(menu_btn_spacer, left_menu_spacer ? left_menu_spacer->get_index() + 1 : 0);
 #endif
 		title_bar->add_child(main_menu_button);
 		if (menu_btn_spacer == nullptr) {
-			title_bar->move_child(main_menu_button, 0);
+			title_bar->move_child(main_menu_button, left_menu_spacer ? left_menu_spacer->get_index() + 1 : 0);
 		} else {
-			title_bar->move_child(main_menu_button, 1);
+			title_bar->move_child(main_menu_button, menu_btn_spacer->get_index() + 1);
 		}
 		memdelete_notnull(main_menu_bar);
 		main_menu_bar = nullptr;
@@ -7412,7 +7446,7 @@ void EditorNode::_update_main_menu_type() {
 		}
 
 		title_bar->add_child(main_menu_bar);
-		title_bar->move_child(main_menu_bar, 0);
+		title_bar->move_child(main_menu_bar, left_menu_spacer ? left_menu_spacer->get_index() + 1 : 0);
 
 		memdelete_notnull(menu_btn_spacer);
 		memdelete_notnull(main_menu_button);
@@ -8074,6 +8108,7 @@ EditorNode::EditorNode() {
 	file_menu->add_separator();
 	file_menu->add_shortcut(ED_SHORTCUT_AND_COMMAND("editor/reload_saved_scene", TTRC("Reload Saved Scene")), SCENE_RELOAD_SAVED_SCENE);
 	file_menu->add_shortcut(ED_SHORTCUT_AND_COMMAND("editor/close_scene", TTRC("Close Scene"), KeyModifierMask::CMD_OR_CTRL + KeyModifierMask::SHIFT + Key::W), SCENE_CLOSE);
+	file_menu->add_shortcut(ED_SHORTCUT_AND_COMMAND("editor/close_all_scenes", TTRC("Close All Scenes")), SCENE_CLOSE_ALL);
 	ED_SHORTCUT_OVERRIDE("editor/close_scene", "macos", KeyModifierMask::CMD_OR_CTRL + Key::W);
 
 	if (!global_menu || !OS::get_singleton()->has_feature("macos")) {
@@ -8191,11 +8226,11 @@ EditorNode::EditorNode() {
 	settings_menu->add_separator();
 
 #ifndef ANDROID_ENABLED
-	if (OS::get_singleton()->get_data_path() == OS::get_singleton()->get_config_path()) {
-		// Configuration and data folders are located in the same place (Windows/macOS).
+	if (EditorPaths::get_singleton()->get_data_dir() == EditorPaths::get_singleton()->get_config_dir()) {
+		// Configuration and data folders are located in the same place.
 		settings_menu->add_item(TTRC("Open Editor Data/Settings Folder"), EDITOR_OPEN_DATA_FOLDER);
 	} else {
-		// Separate configuration and data folders (Linux).
+		// Separate configuration and data folders.
 		settings_menu->add_item(TTRC("Open Editor Data Folder"), EDITOR_OPEN_DATA_FOLDER);
 		settings_menu->add_item(TTRC("Open Editor Settings Folder"), EDITOR_OPEN_CONFIG_FOLDER);
 	}
@@ -8377,14 +8412,14 @@ EditorNode::EditorNode() {
 	default_layout->set_value(docks_section, "dock_4", "FileSystem");
 	default_layout->set_value(docks_section, "dock_5", "Inspector,Node,History");
 
-	// There are 4 vsplits and 4 hsplits.
+	int hsplits[] = { 0, 270, -270, 0 };
+	DEV_ASSERT((int)std::size(hsplits) == editor_dock_manager->get_hsplit_count());
+	for (int i = 0; i < editor_dock_manager->get_hsplit_count(); i++) {
+		default_layout->set_value(docks_section, "dock_hsplit_" + itos(i + 1), hsplits[i]);
+	}
 	for (int i = 0; i < editor_dock_manager->get_vsplit_count(); i++) {
 		default_layout->set_value(docks_section, "dock_split_" + itos(i + 1), 0);
 	}
-	default_layout->set_value(docks_section, "dock_hsplit_1", 0);
-	default_layout->set_value(docks_section, "dock_hsplit_2", 270);
-	default_layout->set_value(docks_section, "dock_hsplit_3", -270);
-	default_layout->set_value(docks_section, "dock_hsplit_4", 0);
 
 	_update_layouts_menu();
 
@@ -8412,6 +8447,7 @@ EditorNode::EditorNode() {
 	confirmation->set_min_size(Vector2(450.0 * EDSCALE, 0));
 	confirmation->connect(SceneStringName(confirmed), callable_mp(this, &EditorNode::_menu_confirm_current));
 	confirmation->connect("custom_action", callable_mp(this, &EditorNode::_discard_changes));
+	confirmation->connect("canceled", callable_mp(this, &EditorNode::_cancel_confirmation));
 
 	save_confirmation = memnew(ConfirmationDialog);
 	save_confirmation->add_button(TTRC("Don't Save"), DisplayServer::get_singleton()->get_swap_cancel_ok(), "discard");
@@ -8483,18 +8519,6 @@ EditorNode::EditorNode() {
 	file_export_lib->add_option(TTR("Merge With Existing"), Vector<String>(), true);
 	file_export_lib->add_option(TTR("Apply MeshInstance Transforms"), Vector<String>(), false);
 	gui_base->add_child(file_export_lib);
-
-	file_script = memnew(EditorFileDialog);
-	file_script->set_title(TTR("Open & Run a Script"));
-	file_script->set_access(EditorFileDialog::ACCESS_FILESYSTEM);
-	file_script->set_file_mode(EditorFileDialog::FILE_MODE_OPEN_FILE);
-	List<String> sexts;
-	ResourceLoader::get_recognized_extensions_for_type("Script", &sexts);
-	for (const String &E : sexts) {
-		file_script->add_filter("*." + E);
-	}
-	gui_base->add_child(file_script);
-	file_script->connect("file_selected", callable_mp(this, &EditorNode::_dialog_action));
 
 	file_pack_zip = memnew(EditorFileDialog);
 	file_pack_zip->connect("file_selected", callable_mp(this, &EditorNode::_dialog_action));
@@ -8697,7 +8721,6 @@ EditorNode::EditorNode() {
 	EditorTranslationParser::get_singleton()->add_parser(packed_scene_translation_parser_plugin, EditorTranslationParser::STANDARD);
 
 	_edit_current();
-	current = nullptr;
 	saving_resource = Ref<Resource>();
 
 	set_process(true);

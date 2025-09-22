@@ -97,19 +97,6 @@ void EmbeddedProcessMacOS::embed_process(OS::ProcessID p_pid) {
 	_try_embed_process();
 }
 
-void EmbeddedProcessMacOS::_joy_connection_changed(int p_index, bool p_connected) const {
-	if (!script_debugger) {
-		return;
-	}
-
-	if (p_connected) {
-		String name = Input::get_singleton()->get_joy_name(p_index);
-		script_debugger->send_message("embed:joy_add", { p_index, name });
-	} else {
-		script_debugger->send_message("embed:joy_del", { p_index });
-	}
-}
-
 void EmbeddedProcessMacOS::reset() {
 	if (!ds) {
 		ds = static_cast<DisplayServerMacOS *>(DisplayServer::get_singleton());
@@ -135,7 +122,10 @@ void EmbeddedProcessMacOS::display_state_changed() {
 	DisplayServerEmbeddedState state;
 	state.screen_max_scale = ds->screen_get_max_scale();
 	state.screen_dpi = ds->screen_get_dpi();
-	state.display_id = ds->window_get_display_id(window->get_window_id());
+	DisplayServer::WindowID wid = window->get_window_id();
+	state.screen_window_scale = ds->screen_get_scale(ds->window_get_current_screen(wid));
+	state.display_id = ds->window_get_display_id(wid);
+
 	PackedByteArray data;
 	state.serialize(data);
 	script_debugger->send_message("embed:ds_state", { data });
@@ -215,9 +205,6 @@ EmbeddedProcessMacOS::EmbeddedProcessMacOS() :
 	layer_host->set_anchors_and_offsets_preset(PRESET_FULL_RECT);
 	layer_host->set_custom_minimum_size(Size2(100, 100));
 
-	Input *input = Input::get_singleton();
-	input->connect(SNAME("joy_connection_changed"), callable_mp(this, &EmbeddedProcessMacOS::_joy_connection_changed));
-
 	// This shortcut allows a user to forcibly release a captured mouse from within the editor, regardless of whether
 	// the embedded process has implemented support to release the cursor.
 	ED_SHORTCUT("game_view/release_mouse", TTRC("Release Mouse"), KeyModifierMask::ALT | Key::ESCAPE);
@@ -249,6 +236,10 @@ void LayerHost::_notification(int p_what) {
 				// Restore embedded process mouse mode.
 				ds->mouse_set_mode(process->get_mouse_mode());
 			}
+			if (!window_focused && script_debugger) {
+				script_debugger->send_message("embed:win_event", { DisplayServer::WINDOW_EVENT_FOCUS_IN });
+				window_focused = true;
+			}
 		} break;
 		case NOTIFICATION_MOUSE_EXIT: {
 			DisplayServer *ds = DisplayServer::get_singleton();
@@ -265,6 +256,10 @@ void LayerHost::_notification(int p_what) {
 			if (ds->mouse_get_mode() != DisplayServer::MOUSE_MODE_VISIBLE) {
 				ds->mouse_set_mode(DisplayServer::MOUSE_MODE_VISIBLE);
 			}
+			if (window_focused && script_debugger) {
+				script_debugger->send_message("embed:win_event", { DisplayServer::WINDOW_EVENT_FOCUS_OUT });
+				window_focused = false;
+			}
 		} break;
 		case MainLoop::NOTIFICATION_OS_IME_UPDATE: {
 			if (script_debugger && has_focus()) {
@@ -280,6 +275,28 @@ void LayerHost::_notification(int p_what) {
 				for (int i = 0; i < DisplayServer::CURSOR_MAX; i++) {
 					ds->cursor_set_custom_image(Ref<Resource>(), (DisplayServer::CursorShape)i, Vector2());
 				}
+			}
+		} break;
+		case NOTIFICATION_WM_WINDOW_FOCUS_IN: {
+			if (!window_focused && script_debugger) {
+				script_debugger->send_message("embed:win_event", { DisplayServer::WINDOW_EVENT_FOCUS_IN });
+				window_focused = true;
+			}
+		} break;
+		case NOTIFICATION_WM_WINDOW_FOCUS_OUT: {
+			if (window_focused && script_debugger) {
+				script_debugger->send_message("embed:win_event", { DisplayServer::WINDOW_EVENT_FOCUS_OUT });
+				window_focused = false;
+			}
+		} break;
+		case NOTIFICATION_APPLICATION_FOCUS_IN: {
+			if (script_debugger) {
+				script_debugger->send_message("embed:notification", { NOTIFICATION_APPLICATION_FOCUS_IN });
+			}
+		} break;
+		case NOTIFICATION_APPLICATION_FOCUS_OUT: {
+			if (script_debugger) {
+				script_debugger->send_message("embed:notification", { NOTIFICATION_APPLICATION_FOCUS_OUT });
 			}
 		} break;
 	}
@@ -304,6 +321,13 @@ void LayerHost::gui_input(const Ref<InputEvent> &p_event) {
 			accept_event();
 			return;
 		}
+	}
+
+	Ref<InputEventJoypadMotion> jm = p_event;
+	Ref<InputEventJoypadButton> jb = p_event;
+	if (jm.is_valid() || jb.is_valid()) {
+		accept_event();
+		return;
 	}
 
 	PackedByteArray data;
