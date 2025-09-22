@@ -32,6 +32,7 @@
 
 #include "core/object/class_db.h"
 #include "time_enums.h"
+#include <cmath>
 
 // This Time class conforms with as many of the ISO 8601 standards as possible.
 // * As per ISO 8601:2004 4.3.2.1, all dates follow the Proleptic Gregorian
@@ -75,6 +76,7 @@ public:
 	double get_unix_time_from_system() const;
 	uint64_t get_ticks_msec() const;
 	uint64_t get_ticks_usec() const;
+	double_t get_ticks_sec() const;
 
 	Time();
 	virtual ~Time();
